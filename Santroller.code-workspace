@@ -4,5 +4,8 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"cmake.buildType": "Debug",
+		"cmake.buildTarget": "i2c_scanner"
+	}
 }

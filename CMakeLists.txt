@@ -612,6 +612,18 @@ pfb_compile_with_bootloader(${TARGET})
 
 pico_add_extra_outputs(${TARGET})
 
+add_executable(i2c_scanner EXCLUDE_FROM_ALL
+    src/mytests/main.cpp
+    src/mytests/i2c_scanner.cpp
+)
+target_link_libraries(i2c_scanner PRIVATE
+  pico_stdlib
+  hardware_i2c
+)
+pico_enable_stdio_usb(i2c_scanner 1)
+pico_enable_stdio_uart(i2c_scanner 0)
+pico_add_extra_outputs(i2c_scanner)
+
 add_custom_target(build_combined ALL
     DEPENDS pico_fota_bootloader ${TARGET}
 )
