@@ -11,7 +11,6 @@ import zipfile
 from xml.etree import ElementTree
 
 MAX_EXCEL_ROWS = 1_048_576
-INVALID_SHEET_CHARACTERS = re.compile(r"[\[\]:*?/\\]")
 XML_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 RELATIONSHIP_NAMESPACE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_RELATIONSHIP_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -19,39 +18,6 @@ CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/conten
 
 ElementTree.register_namespace("", XML_NAMESPACE)
 ElementTree.register_namespace("r", RELATIONSHIP_NAMESPACE)
-
-
-def flatten_settings(value, path=""):
-    """Yield every scalar setting as a path/value pair, retaining array indices."""
-    if isinstance(value, dict):
-        if not value:
-            yield path or "(root)", "{}"
-        else:
-            for key, child in value.items():
-                child_path = f"{path}.{key}" if path else str(key)
-                yield from flatten_settings(child, child_path)
-    elif isinstance(value, list):
-        if not value:
-            yield path or "(root)", "[]"
-        else:
-            for index, child in enumerate(value):
-                yield from flatten_settings(child, f"{path}[{index}]")
-    else:
-        yield path or "(root)", value
-
-
-def safe_sheet_name(name, used_names):
-    """Return a valid, unique Excel worksheet name."""
-    base_name = INVALID_SHEET_CHARACTERS.sub("_", name).strip("'") or "Profile"
-    base_name = base_name[:31]
-    candidate = base_name
-    suffix_number = 2
-    while candidate.casefold() in used_names:
-        suffix = f" ({suffix_number})"
-        candidate = f"{base_name[:31 - len(suffix)]}{suffix}"
-        suffix_number += 1
-    used_names.add(candidate.casefold())
-    return candidate
 
 
 def column_name(column_number):
@@ -317,112 +283,320 @@ def csv_value(value):
     return value
 
 
-def create_csv(data, profiles, output_path):
-    with open(output_path, "w", encoding="utf-8-sig", newline="") as output_file:
-        writer = csv.writer(output_file)
-        writer.writerow(["Profile", "Setting", "Value"])
-
-        for index, profile in enumerate(profiles, 1):
-            options = profile.get("opts")
-            profile_name = options.get("name") if isinstance(options, dict) else None
-            if not isinstance(profile_name, str) or not profile_name.strip():
-                profile_name = f"Profile {index}"
-            for setting, value in flatten_settings(profile):
-                writer.writerow([csv_value(profile_name), csv_value(setting), csv_value(value)])
-
-        global_config = {
-            key: value for key, value in data["config"].items() if key != "profiles"
-        }
-        global_settings = {
-            **{key: value for key, value in data.items() if key != "config"},
-            "config": global_config,
-        }
-        for setting, value in flatten_settings(global_settings):
-            writer.writerow(["Global config", csv_value(setting), csv_value(value)])
-
-
-def create_workbook(data, profiles, output_path):
-    overview_rows = [[
-        "Profile",
-        "UID",
-        "Device to emulate",
-        "Mappings",
-        "LEDs",
-        "Assignments",
-        "Standby wake",
-        "Settings",
-        "Settings sheet",
-    ]]
-    sheets = []
-    used_names = {"overview"}
-
+def profile_names(profiles):
+    names = []
+    seen = set()
     for index, profile in enumerate(profiles, 1):
         options = profile.get("opts")
-        if not isinstance(options, dict):
-            options = {}
-        profile_name = options.get("name")
-        if not isinstance(profile_name, str) or not profile_name.strip():
-            profile_name = f"Profile {index}"
+        name = options.get("name") if isinstance(options, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            name = f"Profile {index}"
+        candidate = name
+        suffix_number = 2
+        while candidate.casefold() in seen:
+            candidate = f"{name} ({suffix_number})"
+            suffix_number += 1
+        seen.add(candidate.casefold())
+        names.append(candidate)
+    return names
 
-        sheet_name = safe_sheet_name(profile_name, used_names)
-        settings = list(flatten_settings(profile))
-        if len(settings) + 1 > MAX_EXCEL_ROWS:
-            raise ValueError(
-                f"Profile '{profile_name}' exceeds Excel's worksheet row limit"
-            )
 
-        overview_rows.append([
-            profile_name,
-            options.get("uid"),
-            options.get("deviceToEmulate"),
-            len(profile.get("mappings", [])) if isinstance(profile.get("mappings"), list) else 0,
-            len(profile.get("leds", [])) if isinstance(profile.get("leds"), list) else 0,
-            len(profile.get("assignments", [])) if isinstance(profile.get("assignments"), list) else 0,
-            len(profile.get("standbyWake", [])) if isinstance(profile.get("standbyWake"), list) else 0,
-            len(settings),
-            sheet_name,
-        ])
-        rows = [["Setting", "Value"]]
-        rows.extend(settings)
-        sheets.append((sheet_name, rows, [72, 48], 2))
+def humanize(value):
+    value = str(value).replace("_", " ")
+    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    value = value.strip().title()
+    for abbreviation, replacement in (
+        ("Gpio", "GPIO"),
+        ("Usb", "USB"),
+        ("Ws2812", "WS2812"),
+        ("I2C", "I2C"),
+        ("Rgb", "RGB"),
+    ):
+        value = value.replace(abbreviation, replacement)
+    return value
 
-    global_config = {
-        key: value for key, value in data["config"].items() if key != "profiles"
+
+def device_labels(config):
+    labels = {}
+    for device in config.get("devices", []):
+        if not isinstance(device, dict):
+            continue
+        device_id = device.get("deviceid", device.get("deviceId"))
+        device_type = next((key for key in device if key not in ("deviceid", "deviceId")), None)
+        if device_id is not None and device_type:
+            labels[device_id] = f"{humanize(device_type)} device {device_id}"
+    return labels
+
+
+def find_input_source(value):
+    source_types = {
+        "gpio", "matrix", "usb", "encoder", "i2c", "midi", "cycle",
+        "accelerometer", "touch", "analog",
     }
-    global_settings = list(flatten_settings({
-        **{key: value for key, value in data.items() if key != "config"},
-        "config": global_config,
-    }))
-    if len(global_settings) + 1 > MAX_EXCEL_ROWS:
-        raise ValueError("Global config exceeds Excel's worksheet row limit")
-    overview_name = "Overview"
-    sheets.insert(
-        0,
-        (overview_name, overview_rows, [36, 12, 28, 12, 10, 14, 14, 12, 24], 9),
-    )
-    sheets.append((
-        "Config Settings",
-        [["Setting", "Value"], *global_settings],
-        [72, 48],
-        2,
-    ))
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in source_types and isinstance(child, dict):
+                if key == "cycle":
+                    nested_source = find_input_source(child.get("input", child))
+                    if nested_source:
+                        return nested_source
+                    continue
+                return key, child
+        for child in value.values():
+            source = find_input_source(child)
+            if source:
+                return source
+    elif isinstance(value, list):
+        for child in value:
+            source = find_input_source(child)
+            if source:
+                return source
+    return None
 
-    # Include config settings as a separate sheet without colliding with profile names.
-    config_sheet = sheets.pop()
-    config_name = safe_sheet_name(config_sheet[0], used_names)
-    sheets.append((config_name, config_sheet[1], config_sheet[2], config_sheet[3]))
-    if len(overview_rows) > MAX_EXCEL_ROWS:
-        raise ValueError("There are too many profiles for the overview worksheet")
 
-    parts = workbook_parts([sheet[0] for sheet in sheets])
+def describe_input(value, labels):
+    source = find_input_source(value)
+    if not source:
+        return "Other", "Always" if isinstance(value, dict) and "staticMapping" in value else "Unspecified"
+
+    source_type, details = source
+    device_id = details.get("deviceid", details.get("deviceId"))
+    device = labels.get(device_id, f"{humanize(source_type)} device {device_id}") if device_id is not None else humanize(source_type)
+    if source_type == "gpio":
+        pin = details.get("pin")
+        description = f"Pin {pin}" if pin is not None and pin >= 0 else "Unassigned pin"
+    elif source_type == "matrix":
+        pin = details.get("pin")
+        output_pin = details.get("outputPin")
+        parts = []
+        if pin is not None:
+            parts.append(f"Input {pin}")
+        if output_pin is not None:
+            parts.append(f"Output {output_pin}")
+        description = ", ".join(parts) or "Unspecified input"
+    else:
+        description = ", ".join(
+            f"{humanize(key)} {item}"
+            for key, item in details.items()
+            if key in ("pin", "button", "channel", "port")
+        ) or "Input"
+    return device, description
+
+
+def mapping_label(mapping):
+    if not isinstance(mapping, dict) or not mapping:
+        return None, None
+    key, value = next(iter(mapping.items()))
+    labels = {
+        "gamepadButton": "Gamepad button",
+        "rbButton": "Rock Band button",
+        "guitarHeroButton": "Guitar Hero button",
+        "drumButton": "Drum button",
+        "keyboardKey": "Keyboard key",
+        "mouseButton": "Mouse button",
+        "midiNote": "MIDI note",
+    }
+    if isinstance(value, (str, int, float, bool)):
+        return labels.get(key, humanize(key)), humanize(value)
+    return labels.get(key, humanize(key)), json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def color_description(device):
+    def color(prefix):
+        red, green, blue = (device.get(f"{prefix}{channel}", 0) for channel in "RGB")
+        text = f"#{red:02X}{green:02X}{blue:02X}"
+        white = device.get(f"{prefix}W")
+        if white is not None:
+            text += f" + white {white}"
+        return text
+
+    end = color("end")
+    if device.get("hasStart") and any(f"start{channel}" in device for channel in "RGB"):
+        start = color("start")
+        if start != end:
+            return f"{start} to {end}"
+    return end
+
+
+def comparison_table(config, profiles):
+    names = profile_names(profiles)
+    labels = device_labels(config)
+    entries = {}
+
+    def add(profile_index, device, usage, input_description, value, group_by_input=True):
+        key = (device, usage, input_description if group_by_input else "")
+        if key not in entries:
+            entries[key] = {"inputs": [], "values": [[] for _ in profiles]}
+        row = entries[key]
+        if input_description not in row["inputs"]:
+            row["inputs"].append(input_description)
+        value = str(value)
+        if value and value not in row["values"][profile_index]:
+            row["values"][profile_index].append(value)
+
+    for profile_index, profile in enumerate(profiles):
+        for mapping in profile.get("mappings", []):
+            if not isinstance(mapping, dict):
+                continue
+            usage, action = mapping_label(mapping.get("mapping"))
+            if not usage:
+                continue
+            device, input_description = describe_input(mapping.get("input"), labels)
+            add(profile_index, device, usage, input_description, action)
+
+        for led in profile.get("leds", []):
+            if not isinstance(led, dict):
+                continue
+            devices = led.get("device")
+            if not isinstance(devices, dict) or not devices:
+                continue
+            device_type, device_settings = next(iter(devices.items()))
+            if not isinstance(device_settings, dict):
+                continue
+            device_id = device_settings.get("deviceId", device_settings.get("deviceid"))
+            device = labels.get(device_id, f"{humanize(device_type)} device {device_id}" if device_id is not None else humanize(device_type))
+            input_device, input_description = describe_input(led.get("mapping"), labels)
+            if input_description == "Always":
+                input_description = "Always"
+            elif input_device not in ("Other", device):
+                input_description = f"{input_device}: {input_description}"
+
+            if device_type == "rgb":
+                led_indices = device_settings.get("activeLed", [])
+                if not isinstance(led_indices, list) or not led_indices:
+                    led_indices = ["All"]
+                for led_index in led_indices:
+                    usage = f"LED {led_index + 1}" if isinstance(led_index, int) else f"{led_index} LEDs"
+                    behavior = color_description(device_settings)
+                    if input_description != "Always":
+                        behavior = f"{input_description}: {behavior}"
+                    add(
+                        profile_index,
+                        device,
+                        usage,
+                        input_description,
+                        behavior,
+                        group_by_input=False,
+                    )
+            elif device_type == "display":
+                element_type = humanize(device_settings.get("type", "Display element"))
+                x, y = device_settings.get("x"), device_settings.get("y")
+                position = f"Position {x}, {y}" if x is not None and y is not None else "Position unspecified"
+                text = device_settings.get("text", device_settings.get("value", ""))
+                add(profile_index, device, element_type, position, text or "(no text)")
+            else:
+                add(
+                    profile_index,
+                    device,
+                    humanize(device_type),
+                    input_description,
+                    json.dumps(device_settings, ensure_ascii=False, sort_keys=True),
+                )
+
+        def find_input_assignments(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key == "inputAnyTime" and isinstance(child, dict):
+                        yield child
+                    else:
+                        yield from find_input_assignments(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from find_input_assignments(child)
+
+        for assignment in find_input_assignments(profile.get("assignments", [])):
+            assigned_input = assignment.get("input")
+            cycle = assigned_input.get("cycle") if isinstance(assigned_input, dict) else None
+            if isinstance(cycle, dict):
+                usage = "Profile selection"
+                cycle_id = cycle.get("deviceid", cycle.get("deviceId"))
+                device = labels.get(cycle_id, f"Cycle device {cycle_id}")
+                source = find_input_source(cycle.get("input"))
+                input_device, source_description = describe_input(
+                    cycle.get("input"), labels
+                )
+                if source and source[0] == "gpio" and source[1].get("pin", -1) < 0:
+                    input_description = "Cycle control"
+                    value_prefix = ""
+                else:
+                    input_description = (
+                        f"{input_device}: {source_description}"
+                        if input_device != "Other"
+                        else source_description
+                    )
+                    value_prefix = f"{input_description}: "
+                cycle_value = assignment.get("triggerValue")
+                value = (
+                    f"{value_prefix}Cycle value {cycle_value}"
+                    if cycle_value is not None
+                    else f"{value_prefix}Cycle control"
+                )
+                add(
+                    profile_index,
+                    device,
+                    usage,
+                    input_description,
+                    value,
+                    group_by_input=False,
+                )
+            else:
+                device, input_description = describe_input(assigned_input, labels)
+                usage = "Profile shortcut"
+                value = humanize(assignment.get("trigger", "Assigned"))
+                add(profile_index, device, usage, input_description, value)
+
+        for wake_input in profile.get("standbyWake", []):
+            if isinstance(wake_input, dict):
+                device, input_description = describe_input(wake_input.get("input", wake_input), labels)
+                add(profile_index, device, "Wake from standby", input_description, "Wake")
+
+        options = profile.get("opts")
+        if isinstance(options, dict):
+            option_labels = {
+                "deviceToEmulate": ("Controller", "Emulated device"),
+                "faceButtonMappingMode": ("Controller", "Face-button layout"),
+                "xinputOnWindows": ("Controller", "XInput on Windows"),
+                "ps4OrPs5Mode": ("Controller", "PlayStation mode"),
+                "supportsSlider": ("Controller", "Slider support"),
+            }
+            for option, (device, usage) in option_labels.items():
+                if option in options:
+                    add(profile_index, device, usage, "Profile option", humanize(options[option]))
+
+    sort_key = lambda value: [
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"(\d+)", value)
+    ]
+    rows = [["Device", "Usage", "Input", *names]]
+    for (device, usage, input_key), row in sorted(
+        entries.items(), key=lambda item: tuple(sort_key(part) for part in item[0])
+    ):
+        input_description = input_key or "; ".join(sorted(row["inputs"], key=sort_key))
+        values = ["; ".join(profile_values) for profile_values in row["values"]]
+        rows.append([device, usage, input_description, *values])
+    return rows
+
+
+def create_csv(config, profiles, output_path):
+    rows = comparison_table(config, profiles)
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerows([[csv_value(value) for value in row] for row in rows])
+
+
+def create_workbook(config, profiles, output_path):
+    rows = comparison_table(config, profiles)
+    if len(rows) > MAX_EXCEL_ROWS:
+        raise ValueError("Comparison exceeds Excel's worksheet row limit")
+    widths = [24, 28, 38, *([28] * len(profiles))]
+    parts = workbook_parts(["Comparison"])
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as workbook_file:
         for name, content in parts.items():
             workbook_file.writestr(name, content)
-        for index, (_, rows, widths, filter_columns) in enumerate(sheets, 1):
-            workbook_file.writestr(
-                f"xl/worksheets/sheet{index}.xml",
-                worksheet_xml(rows, widths, filter_columns),
-            )
+        workbook_file.writestr(
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, widths, len(rows[0])),
+        )
 
 
 def main():
@@ -450,9 +624,9 @@ def main():
     try:
         data, profiles = load_config(args.input)
         if args.format == "csv":
-            create_csv(data, profiles, output_path)
+            create_csv(data["config"], profiles, output_path)
         else:
-            create_workbook(data, profiles, output_path)
+            create_workbook(data["config"], profiles, output_path)
     except (OSError, json.JSONDecodeError, ValueError) as error:
         parser.error(str(error))
 
