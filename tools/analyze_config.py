@@ -403,19 +403,14 @@ def mapping_label(mapping):
 
 def color_description(device):
     def color(prefix):
-        red, green, blue = (device.get(f"{prefix}{channel}", 0) for channel in "RGB")
-        text = f"#{red:02X}{green:02X}{blue:02X}"
-        white = device.get(f"{prefix}W")
-        if white is not None:
-            text += f" + white {white}"
-        return text
+        red, green, blue = (
+            device.get(f"{prefix}{channel}", 0) for channel in "RGB"
+        )
+        return f"#{red:02X}{green:02X}{blue:02X}"
 
-    end = color("end")
-    if device.get("hasStart") and any(f"start{channel}" in device for channel in "RGB"):
-        start = color("start")
-        if start != end:
-            return f"{start} to {end}"
-    return end
+    pressed = color("end")
+    released = color("start") if device.get("hasStart") else "#000000"
+    return f"Pressed: {pressed}; Released: {released}"
 
 
 def comparison_table(config, profiles):
